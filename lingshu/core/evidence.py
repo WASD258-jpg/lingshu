@@ -92,6 +92,7 @@ class EvidenceLedger:
 
     def __init__(self, store):
         self.store = store
+        self.on_change = None  # 证据变化回调（TMS 用于下游传播；None = 无）
         with store._lock:
             c = store.conn
             c.execute(_DDL)
@@ -117,6 +118,8 @@ class EvidenceLedger:
                  1 if self_generated else 0, (note or "")[:500], time.time()))
             c.commit()
         self.sync(node_id)
+        if self.on_change is not None:
+            self.on_change(node_id)
         return eid
 
     def sync(self, node_id: str) -> float:
