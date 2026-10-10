@@ -47,6 +47,41 @@ def enabled() -> bool:
     return os.environ.get(ENV_FLAG, "").strip() == "1"
 
 
+# ---------- 语境扩展（LINGSHU_FTS_CONTEXT=1，须同时开 LINGSHU_FTS；默认关闭） ----------
+CONTEXT_FLAG = "LINGSHU_FTS_CONTEXT"
+NEIGHBOR_GAMMA = 0.2        # 时序邻居继承的 BM25 份额（只在切A 上选定）
+NEIGHBOR_WINDOW_S = 3600.0  # 只把 1 小时内的前后条视为同一语境
+NEIGHBOR_SEEDS = 30         # 只从 BM25 前 N 个候选向外扩
+
+# 问句/指令功能二元组：出题模板里的「请说明」「哪些」「这部作品」「人物」等，几乎与任何
+# 叙述块都共现，却不指向证据。手写通用表（不依赖任何语料统计），只作用于查询侧；
+# 全部被滤掉时保留原查询，避免空查询。
+QUERY_FUNCTION_GRAMS = frozenset("""
+请说 说明 请指 指出 请结 结合 分析 请分 简述 请简 概括 请概 描述 请描 为什 什么 怎样 怎么
+如何 哪些 哪个 哪里 哪儿 是否 是不 有没 没有 至少 两处 一处 几处 各自 作用 方式 关系 以及
+这部 部作 作品 这篇 篇小 小说 故事 事里 品里 里的 中的 的人 人物 是个 个怎 样的 的作 的身
+身份 立场 体现 表现 具体 例子 举例 原因 为何 何种 哪种 么样 么要 么方 用什 出来 了出 讲了
+做了 上做 安排 设计 并说 明各 明他 他的 她的 它的 们的 这个 那个 这些 那些 一个 时候 之间
+前后 后来 最后 开始
+""".split())
+
+
+def context_enabled() -> bool:
+    return enabled() and os.environ.get(CONTEXT_FLAG, "").strip() == "1"
+
+
+def content_grams(terms: Sequence[str]) -> List[str]:
+    """查询二元组去掉问句功能词；全被去掉时原样返回。"""
+    toks, seen = [], set()
+    for t in terms:
+        for g in grams(t):
+            if g not in seen:
+                seen.add(g)
+                toks.append(g)
+    kept = [g for g in toks if g not in QUERY_FUNCTION_GRAMS]
+    return kept or toks
+
+
 def grams(text: str) -> List[str]:
     """字符二元组（段内），单字段保留单字；保序去重。
 
@@ -88,6 +123,8 @@ class FTSIndex:
                 c.execute("CREATE TABLE IF NOT EXISTS nodes_fts_map "
                           "(nid TEXT PRIMARY KEY, frid INTEGER, h TEXT)")
                 c.execute("CREATE TABLE IF NOT EXISTS nodes_fts_dirty (nid TEXT PRIMARY KEY)")
+                # 语境扩展按 temporal_coordinate 取前后条；索引只服务检索，属派生结构
+                c.execute("CREATE INDEX IF NOT EXISTS idx_nodes_fts_tc ON nodes(temporal_coordinate)")
                 c.execute("CREATE TRIGGER IF NOT EXISTS nodes_fts_ai AFTER INSERT ON nodes "
                           "BEGIN INSERT OR IGNORE INTO nodes_fts_dirty VALUES (new.id); END")
                 c.execute("CREATE TRIGGER IF NOT EXISTS nodes_fts_au AFTER UPDATE OF id, content, tags "
@@ -193,6 +230,29 @@ class FTSIndex:
                 break
             inner = inner << 2  # 内层放大 4 倍
         return [(tuple(r)[:-1], -float(r["_b"])) for r in rows[:want]]
+
+    def temporal_neighbors(self, nids: Sequence[str], layers=None,
+                           window: float = NEIGHBOR_WINDOW_S) -> List[Tuple[str, tuple]]:
+        """[(种子 nid, 邻居 nodes 行)]：每个种子取 temporal_coordinate 紧邻的前一条与后一条，
+        间隔超过 window 秒的不算（会话边界）。同层过滤与 search_content 一致。"""
+        conn = self.store.conn
+        lay, lp = "", []
+        if layers:
+            lay = f" AND layer IN ({','.join('?' for _ in layers)})"
+            lp = [l.value for l in layers]
+        out = []
+        for nid in nids:
+            r = conn.execute("SELECT temporal_coordinate FROM nodes WHERE id=?", (nid,)).fetchone()
+            if not r or r[0] is None:
+                continue
+            tc = float(r[0])
+            for op, order in (("<", "DESC"), (">", "ASC")):
+                row = conn.execute(
+                    f"SELECT * FROM nodes WHERE temporal_coordinate {op} ? AND id != ?{lay} "
+                    f"ORDER BY temporal_coordinate {order} LIMIT 1", [tc, nid] + lp).fetchone()
+                if row is not None and abs(float(row["temporal_coordinate"]) - tc) <= window:
+                    out.append((nid, tuple(row)))
+        return out
 
     @staticmethod
     def blend(jaccard: float, bm25_pos: float) -> float:
