@@ -780,14 +780,33 @@ class LayeredStore:
             ''', (delta, time.time(), node_id))
             self.conn.commit()
 
-    def increment_access(self, node_id: str):
-        """访问计数+1（尽力而为：外部写锁持有时立即放弃，不阻塞检索主流程）"""
+    @staticmethod
+    def _retrieval_touches_recency() -> bool:
+        """检索命中是否刷新 last_access。
+
+        默认 True（与改前一致）。`LINGSHU_RETRIEVAL_NO_TOUCH=1` 时为 False：检索只计
+        access_count，不再把 last_access 改成「现在」。原因：recall 的近因分量
+        （0.2·1/(1+天数)）读的正是 last_access，而 search_content 每返回一个节点就
+        刷新它 ⇒「被搜到一次 → 下次更容易被搜到」的自增强回路，与该记忆是否被
+        真正使用、是否正确无关。关闭后 last_access 只由写入、M5 重复观测、置信度
+        复核、巩固复述等**真实强化**事件刷新。"""
+        return os.environ.get("LINGSHU_RETRIEVAL_NO_TOUCH", "").strip() != "1"
+
+    def increment_access(self, node_id: str, touch: bool = True):
+        """访问计数+1（尽力而为：外部写锁持有时立即放弃，不阻塞检索主流程）。
+
+        touch=False：只计数、不刷新 last_access（检索路径在开关打开时使用）。"""
         try:
             obs = sqlite3.connect(self.db_path, timeout=0)
             try:
-                obs.execute(
-                    'UPDATE nodes SET access_count = access_count + 1,'
-                    ' last_access = ? WHERE id=?', (time.time(), node_id))
+                if touch:
+                    obs.execute(
+                        'UPDATE nodes SET access_count = access_count + 1,'
+                        ' last_access = ? WHERE id=?', (time.time(), node_id))
+                else:
+                    obs.execute(
+                        'UPDATE nodes SET access_count = access_count + 1 WHERE id=?',
+                        (node_id,))
                 obs.commit()
             finally:
                 obs.close()
@@ -1323,8 +1342,9 @@ class LayeredStore:
         # 同分按重要性降序（高质量记忆优先，避免并列截断排挤重要节点）
         scored.sort(key=lambda x: (-x[1], -x[0].importance))
         results = scored[:limit]
+        touch = self._retrieval_touches_recency()
         for node, _ in results:
-            self.increment_access(node.id)
+            self.increment_access(node.id, touch=touch)
         return results
 
     @staticmethod
@@ -1343,7 +1363,7 @@ class LayeredStore:
             node = self.get_node(nid)
             if node:
                 nodes.append(node)
-                self.increment_access(nid)
+                self.increment_access(nid, touch=self._retrieval_touches_recency())
         return nodes
 
     @_transactional
