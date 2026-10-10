@@ -2118,6 +2118,9 @@ class SpacetimeMemoryEngine:
         self._evidence = None              # 证据账本（默认关闭；见 enable_evidence_ledger）
         if os.environ.get("LINGSHU_EVIDENCE_LEDGER") == "1":
             self.enable_evidence_ledger()
+        self._tms = None                   # 真值维护（默认关闭；见 enable_tms）
+        if os.environ.get("LINGSHU_TMS") == "1":
+            self.enable_tms()
         self._setup_v13()
         # ---- v1.5 状态（A-1~A-5） ----
         self._verifier_config = {"dedup_static": 0.85, "deviation_threshold": 0.3}
@@ -2435,8 +2438,27 @@ class SpacetimeMemoryEngine:
         return ledger.assess(node_id)
 
     def evidence_report(self, node_id: str) -> Dict:
-        """只读：节点的证据评估（置信度、状态、支持/反驳来源）。"""
+        """只读：节点的证据评估（置信度、状态、支持/反驳来源）；启用 TMS 时附依据与撤回信息。"""
+        if getattr(self, "_tms", None) is not None:
+            return self._tms.assess(node_id)
         return self.enable_evidence_ledger().assess(node_id)
+
+    # ==================== 真值维护（依赖撤回 · 默认关闭） ====================
+
+    def enable_tms(self):
+        """启用真值维护（隐含启用证据账本）：结论的置信度不高于其最强依据中最弱的前提；
+        前提被反证推翻后，下游结论自动撤回为「前提已被推翻」（见 core/tms.py）。"""
+        if getattr(self, "_tms", None) is None:
+            from .tms import TruthMaintenance
+            ledger = self.enable_evidence_ledger()
+            self._tms = TruthMaintenance(self.store, ledger)
+            ledger.on_change = lambda nid: self._tms.propagate([nid])
+        return self._tms
+
+    def add_justification(self, conclusion_id: str, premise_ids: List[str],
+                          source: str = None) -> str:
+        """登记一条依据：conclusion ← premises（合取）。同一结论可登记多条（析取）。"""
+        return self.enable_tms().add_justification(conclusion_id, premise_ids, source)
 
     def recall_with_evidence(self, context_content: str, limit: int = 10,
                              include_refuted: bool = False) -> List[Dict]:
@@ -2445,10 +2467,12 @@ class SpacetimeMemoryEngine:
         与 recall() 同序；已被反驳的条目默认剔除（include_refuted=True 保留）。
         """
         ledger = self.enable_evidence_ledger()
+        tms = getattr(self, "_tms", None)
         out = []
         for node, score in self.recall(context_content, limit=limit):
-            ev = ledger.assess(node.id)
-            if ev["status"] == "refuted" and not include_refuted:
+            ev = tms.assess(node.id) if tms is not None else ledger.assess(node.id)
+            # 启用 TMS 时，「前提已被推翻」与「已被反驳」同等对待（默认不进结果）
+            if ev["status"] in ("refuted", "undermined") and not include_refuted:
                 continue
             out.append({"node": node, "score": score, "evidence": ev})
         return out
