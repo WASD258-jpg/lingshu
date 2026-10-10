@@ -490,6 +490,16 @@ class LayeredStore:
                     raise
                 _t.sleep(1.5 * (2 ** attempt))  # 1.5s / 3s 退避
         self._lock = threading.Lock()
+        # 检索候选生成：FTS5 二元组倒排 + BM25（LINGSHU_FTS=1 启用，默认关闭；Refs #35）
+        self._fts = None
+        try:
+            from lingshu.core import retrieval as _retrieval
+            if _retrieval.enabled():
+                self._fts = _retrieval.FTSIndex.attach(self)
+            else:
+                _retrieval.FTSIndex.detach(self)
+        except Exception:
+            self._fts = None
 
     def _connect(self, dsn: str):
         """建立本线程的连接并登记，返回登记用的连接槽（`_ThreadConn`）。
@@ -1287,6 +1297,10 @@ class LayeredStore:
         if not q:
             return []
         terms = self.expand_query_terms(q)
+        if getattr(self, "_fts", None) is not None:
+            fts_hits = self._search_content_fts(q, terms, layers, limit)
+            if fts_hits is not None:
+                return fts_hits
         conds, params = [], []
         if layers:
             ph = ",".join("?" for _ in layers)
@@ -1323,6 +1337,40 @@ class LayeredStore:
         # 同分按重要性降序（高质量记忆优先，避免并列截断排挤重要节点）
         scored.sort(key=lambda x: (-x[1], -x[0].importance))
         results = scored[:limit]
+        for node, _ in results:
+            self.increment_access(node.id)
+        return results
+
+    def _search_content_fts(self, q: str, terms, layers, limit: int):
+        """FTS5+BM25 候选生成（retrieval.py）。返回 None 表示交回原 LIKE 路径。
+
+        候选按 BM25 从全库取（不再受插入顺序与 LIMIT 300/500 截断影响）；
+        分数 = max(原 Jaccard+tag 加成, 0.9·s/(s+K))，≥0.95 判重语义只来自 Jaccard。"""
+        from lingshu.core.retrieval import FTSIndex
+        try:
+            cands = self._fts.candidates([q] + [t for t in terms if t != q], layers,
+                                         k=max(int(limit) * 5, 100))
+        except sqlite3.Error:
+            return None
+        if cands is None:
+            return None
+        scored = []
+        for row, bm in cands:
+            node = STNode.from_row(row)
+            sim = self.char_bigram_jaccard(q, node.content)
+            tag_bonus = 0.05 if any(t in q or q in t for t in node.tags) else 0.0
+            scored.append((node, FTSIndex.blend(min(1.0, sim + tag_bonus), bm), bm))
+        # 精确度闸门（与原路径语义对齐）：候选里存在逐字包含查询原文的节点时，只返回这些
+        # ——原 LIKE 命中路径的语义；查询原文无逐字命中（自然语言问句、带空格的关键词串）
+        # 时才放开为 BM25 部分匹配，这正是原路径退化为「扫前 500 行」的情形。
+        ql = q.lower()
+        verbatim = [x for x in scored
+                    if ql in (x[0].content or "").lower()
+                    or any(ql in str(t).lower() for t in (x[0].tags or []))]
+        if verbatim:
+            scored = verbatim
+        scored.sort(key=lambda x: (-x[1], -x[2], -x[0].importance))
+        results = [(n, s) for n, s, _ in scored[:limit]]
         for node, _ in results:
             self.increment_access(node.id)
         return results
