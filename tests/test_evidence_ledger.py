@@ -31,7 +31,10 @@ def _engine(ledger=True, db=":memory:"):
     return e
 
 
-def test_default_off_keeps_legacy_increment():
+def test_default_off_keeps_legacy_increment(monkeypatch):
+    # 「默认关闭」口径：隔离全局开关（LINGSHU_TMS=1 隐含启用账本）
+    for k in ("LINGSHU_EVIDENCE_LEDGER", "LINGSHU_TMS"):
+        monkeypatch.delenv(k, raising=False)
     e = _engine(ledger=False)
     n = e.add_perception(FACT)
     for _ in range(25):
