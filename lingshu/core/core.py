@@ -1346,10 +1346,14 @@ class LayeredStore:
 
         候选按 BM25 从全库取（不再受插入顺序与 LIMIT 300/500 截断影响）；
         分数 = max(原 Jaccard+tag 加成, 0.9·s/(s+K))，≥0.95 判重语义只来自 Jaccard。"""
-        from lingshu.core.retrieval import FTSIndex
+        from lingshu.core import retrieval as _rt
+        FTSIndex = _rt.FTSIndex
+        ctx = _rt.context_enabled()
+        qterms = [q] + [t for t in terms if t != q]
         try:
-            cands = self._fts.candidates([q] + [t for t in terms if t != q], layers,
-                                         k=max(int(limit) * 5, 100))
+            if ctx:  # 语境扩展：查询侧去掉问句功能二元组
+                qterms = _rt.content_grams(qterms)
+            cands = self._fts.candidates(qterms, layers, k=max(int(limit) * 5, 100))
         except sqlite3.Error:
             return None
         if cands is None:
@@ -1360,10 +1364,15 @@ class LayeredStore:
             sim = self.char_bigram_jaccard(q, node.content)
             tag_bonus = 0.05 if any(t in q or q in t for t in node.tags) else 0.0
             scored.append((node, FTSIndex.blend(min(1.0, sim + tag_bonus), bm), bm))
+        ql = q.lower()
+        has_verbatim = any(ql in (x[0].content or "").lower()
+                           or any(ql in str(t).lower() for t in (x[0].tags or []))
+                           for x in scored)
+        if ctx and scored and not has_verbatim:
+            scored = self._fts_context_smooth(q, scored, layers)
         # 精确度闸门（与原路径语义对齐）：候选里存在逐字包含查询原文的节点时，只返回这些
         # ——原 LIKE 命中路径的语义；查询原文无逐字命中（自然语言问句、带空格的关键词串）
         # 时才放开为 BM25 部分匹配，这正是原路径退化为「扫前 500 行」的情形。
-        ql = q.lower()
         verbatim = [x for x in scored
                     if ql in (x[0].content or "").lower()
                     or any(ql in str(t).lower() for t in (x[0].tags or []))]
@@ -1374,6 +1383,35 @@ class LayeredStore:
         for node, _ in results:
             self.increment_access(node.id)
         return results
+
+    def _fts_context_smooth(self, q: str, scored, layers):
+        """时序邻接平滑：节点的 BM25 加上其前/后一条（同会话窗口内）BM25 的 γ 倍取大者。
+
+        证据常落在命中段落的前后条（对话的上一句、叙述的下一段），它们与问句本身没有共享
+        字面。只在自然语言问句路径（无逐字命中）启用，逐字命中语义不变。"""
+        from lingshu.core import retrieval as _rt
+        bm = {n.id: b for n, _, b in scored}
+        node_of = {n.id: n for n, _, _ in scored}
+        seeds = [n.id for n, _, b in sorted(scored, key=lambda x: -x[2])[:_rt.NEIGHBOR_SEEDS]]
+        bonus: Dict[str, float] = {}
+        try:
+            pairs = self._fts.temporal_neighbors(seeds, layers)
+        except sqlite3.Error:
+            return scored
+        for seed, row in pairs:
+            add = _rt.NEIGHBOR_GAMMA * bm[seed]
+            if add <= 0:
+                continue
+            nb = STNode.from_row(row)
+            node_of.setdefault(nb.id, nb)
+            bonus[nb.id] = max(bonus.get(nb.id, 0.0), add)
+        out = []
+        for nid, node in node_of.items():
+            b = bm.get(nid, 0.0) + bonus.get(nid, 0.0)
+            sim = self.char_bigram_jaccard(q, node.content)
+            tag_bonus = 0.05 if any(t in q or q in t for t in node.tags) else 0.0
+            out.append((node, _rt.FTSIndex.blend(min(1.0, sim + tag_bonus), b), b))
+        return out
 
     @staticmethod
     def _bigrams(s: str) -> set:
