@@ -46,6 +46,7 @@ except ImportError:  # 直跑 fallback（裸名互导）
 # ② 白名单组件另由本守卫收口（含排除脚本目录）；③ 仍不覆盖：进程已被预置投毒
 # （sys.modules 预置 / 进程内 sys.path.insert）、逃生口 LINGSHU_ALLOW_CWD_IMPORTS 被
 # 显式打开的情形。
+from . import contradiction as _contradiction
 from .component_resolver import (
     COMPONENT_NAMES as _COMPONENT_NAMES,
     discovery_report as _component_discovery_report,
@@ -2352,6 +2353,7 @@ class SpacetimeMemoryEngine:
         self._interaction_count += 1
         self._note_action("perception", content, None,
                           {"importance": importance, "modality": modality})
+        contra = None  # (近重复但冲突的旧节点, 原因)
         # ---- M5 去重：中文二元组 Jaccard ≥ 动态阈值 → 提升原节点，不新增 ----
         if not skip_dedup and isinstance(content, str) and content.strip():
             threshold = self._effective_dedup_threshold()
@@ -2365,10 +2367,17 @@ class SpacetimeMemoryEngine:
                 if sim > best_sim:
                     best_sim, best = sim, n
             if best and best_sim >= threshold:
-                self.store.increment_access(best.id)
-                self.store.update_node_confidence(best.id, 0.02)
-                self.store.tag_node(best.id, "duplicate")
-                return best
+                # 矛盾感知（LINGSHU_CONTRADICTION=1，默认关闭；Refs #142）：近重复但极性 /
+                # 数值 / 反义冲突 → 不合并、不增信，另建节点并以 OPPOSITE 边连接两侧
+                if _contradiction.enabled():
+                    reason = _contradiction.conflict(content, best.content)
+                    if reason:
+                        contra = (best, reason)
+                if contra is None:
+                    self.store.increment_access(best.id)
+                    self.store.update_node_confidence(best.id, 0.02)
+                    self.store.tag_node(best.id, "duplicate")
+                    return best
         cs = condition_space or ConditionSpace(
             observation_position="感知系统",
             observation_tool="感官输入",
@@ -2396,6 +2405,13 @@ class SpacetimeMemoryEngine:
         if entities:
             for eid in entities:
                 self.store.tag_node(node.id, f"ent:{eid}")
+        if contra is not None:
+            # 复用既有的矛盾标记通道 register_conflict（OPPOSITE 边，未验证，置信度 0.3，
+            # 标签 conflict，待验证单元复核）——此前该通道没有任何自动调用方
+            other, reason = contra
+            self.store.register_conflict(node.id, other.id)
+            for nid in (node.id, other.id):
+                self.store.tag_node(nid, f"conflict:{reason}")
         return node
 
     # ==================== 锚点层操作 ====================
@@ -2673,6 +2689,38 @@ class SpacetimeMemoryEngine:
         """依赖注入（D-005）：provider.encode(text)->List[float]；provider.search(query,limit)->List[str]"""
         self._embedding_provider = provider
 
+    def _with_opposites(self, scored, limit: int):
+        """矛盾两侧同时呈现（LINGSHU_CONTRADICTION=1）：top-limit 中任一节点若有 OPPOSITE 边，
+        把对侧插到它紧后面（分数 = 宿主分数 - 1e-6）；对侧已在榜内则不动，超出 limit
+        的从队尾挤出。只读边，不改其余节点的分数与相对次序。"""
+        top = list(scored[:limit])
+        ids = {n.id for n, _ in top}
+        out, paired = [], set()
+        for node, sc in top:
+            out.append((node, sc))
+            for e in (self.store.get_outgoing_edges(node.id) +
+                      self.store.get_incoming_edges(node.id)):
+                if e.relation_type != EdgeType.OPPOSITE:
+                    continue
+                oid = e.target_id if e.source_id == node.id else e.source_id
+                if oid in ids:
+                    continue
+                other = self.store.get_node(oid)
+                if other is None:
+                    continue
+                ids.add(oid)
+                paired.update((node.id, oid))
+                out.append((other, sc - 1e-6))
+        # 回到 limit 条：先从队尾挤掉不成对的节点；矛盾对不拆开（极端情况下可略超 limit）
+        while len(out) > limit:
+            for k in range(len(out) - 1, -1, -1):
+                if out[k][0].id not in paired:
+                    del out[k]
+                    break
+            else:
+                break
+        return out
+
     def recall(self, context_content: str, limit: int = 10) -> List[Tuple[STNode, float]]:
         """组合联想（内容相似 0.5 + 重要性 0.3 + 近因 0.2）——记忆参与推理（1.1.1）"""
         results = self.store.search_content(context_content, limit=50)
@@ -2686,6 +2734,9 @@ class SpacetimeMemoryEngine:
             score = 0.5 * sim + 0.3 * (node.importance or 0.0) + 0.2 * recency
             scored.append((node, score))
         scored.sort(key=lambda x: -x[1])
+        if _contradiction.enabled():
+            scored = self._with_opposites(scored, limit)
+            limit = max(limit, len(scored))  # 矛盾对不拆开（见 _with_opposites）
         self._note_reuse([n.id for n, _ in scored[:limit]])
         # v1.12 P0-5a：模式成员召回加权
         if self._self_cognition is not None:
