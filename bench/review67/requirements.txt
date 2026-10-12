@@ -1,0 +1,7 @@
+mem0ai==2.2.1
+fastembed==0.9.0
+qdrant-client==1.19.1
+basic-memory==0.23.2
+sqlite-vec==0.1.9
+pyyaml==6.0.2
+jieba==0.42.1
