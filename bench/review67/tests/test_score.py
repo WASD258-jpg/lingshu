@@ -93,8 +93,7 @@ EXPECT = {  # 报告引用的代表读数（runs 文件, 指标, 报告值）
 
 def g5(S):
     if not (os.path.isdir(os.path.join(HERE, "runs")) and os.path.isdir(os.path.join(HERE, "data"))):
-        print("  G5 跳过：需要 runs/（tar xzf runs.tar.gz）与 data/（python fetch_data.py）")
-        return
+        return "跳过：需要 runs/（tar xzf runs.tar.gz）与 data/（python fetch_data.py）"
     S._cache.clear()
     for f, k, v in sorted(EXPECT):
         meta, rows = S.load(os.path.join(HERE, "runs", f + ".jsonl"))
@@ -111,8 +110,8 @@ def run(src, quiet=False):
     for name, g in GUARDS:
         S = load_score(src)
         try:
-            g(S)
-            quiet or print(f"  {name} 通过")
+            skip = g(S)
+            quiet or print(f"  {name} {skip or '通过'}")
         except Exception as e:  # noqa: BLE001
             failed.append(name)
             quiet or print(f"  {name} 失败：{e!r}")
