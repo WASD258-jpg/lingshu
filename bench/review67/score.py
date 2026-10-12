@@ -127,4 +127,5 @@ def main():
               f"95%CI[{sc * lo:+.{3 if sc == 1 else 1}f}, {sc * hi:+.{3 if sc == 1 else 1}f}]")
 
 
-main()
+if __name__ == "__main__":
+    main()
