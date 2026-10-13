@@ -88,6 +88,8 @@ STDLIB_ALLOWED = frozenset({
     # IO / 文本 / 数值 / 随机（difflib：矛盾感知 contradiction.py 引入——标准库字符级对齐；
     # 守卫按设计判红「未知裸名」，此处补分类而非放宽判据）
     "io", "re", "math", "random", "difflib",
+    # 日期（datetime：相对时间锚定 timeanchor.py 引入——标准库公历日运算）
+    "datetime",
     # 命令行 / 子进程
     "argparse", "subprocess",
 })
