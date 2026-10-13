@@ -692,6 +692,17 @@ class LayeredStore:
         except Exception:
             self._fts = None
 
+        # 相对时间锚定：节点事件区间派生索引（LINGSHU_TIME_ANCHOR=1 启用，默认关闭）
+        self._when = None
+        try:
+            from lingshu.core import timeanchor as _ta
+            if _ta.enabled():
+                self._when = _ta.WhenIndex.attach(self)
+            else:
+                _ta.WhenIndex.detach(self)
+        except Exception:
+            self._when = None
+
     def _connect(self, dsn: str):
         """建立本线程的连接并登记，返回登记用的连接槽（`_ThreadConn`）。
 
@@ -1668,10 +1679,76 @@ class LayeredStore:
         # 判据来源：经验标定（#29 修复轮；理论章节追不到）。
         scored.sort(key=lambda x: (-x[1], -x[0].importance, -x[0].confidence))
         results = self._anchor_rerank(q, scored[:limit], layers, limit)
+        results = self._time_rerank(q, results, layers, limit)
         touch = self._retrieval_touches_recency()
         for node, _ in results:
             self.increment_access(node.id, touch=touch)
         return results
+
+    def _time_rerank(self, q: str, results, layers, limit: int):
+        """相对时间锚定（LINGSHU_TIME_ANCHOR=1）：问句点名日期 / 时段时，事件区间与之有交集的
+        节点按区间内相关度排在最前，余位按原排序补齐。无日期 / 开关关 / 区间内为空 → 原样返回。
+
+        事件区间由 timeanchor.WhenIndex 以节点 temporal_coordinate 为参照归一内容里的相对时间
+        写法得到（「yesterday」「上周二」）；区间内相关度与结构锚定同式（BM25×Jaccard blend /
+        Jaccard+tag），同分按区间宽度（窄者先）、temporal_coordinate、id 定序。"""
+        from lingshu.core import timeanchor as _ta
+        if not _ta.enabled():
+            return results
+        when = getattr(self, "_when", None)
+        if when is None:  # 引擎建好后才开启开关：首次点名日期时挂载并全量补齐
+            when = self._when = _ta.WhenIndex.attach(self)
+            if when is None:
+                return results
+        iv = _ta.parse_query(q)
+        if iv is None:
+            return results
+        try:
+            nids = when.overlapping(iv)
+        except sqlite3.Error:
+            return results
+        if not nids:
+            return results
+        lays = {l.value for l in (layers or [l for l in MemoryLayer if l != MemoryLayer.SELF])}
+        rows = []
+        c = self.conn.cursor()
+        for i in range(0, len(nids), 500):
+            part = nids[i:i + 500]
+            c.execute("SELECT * FROM nodes WHERE id IN (%s)" % ",".join("?" for _ in part), part)
+            rows.extend(c.fetchall())
+        nodes, _ = self._tolerant_nodes(rows)  # #267 逐行容错
+        rank_of = {nid: k for k, nid in enumerate(nids)}
+        nodes = [n for n in nodes if getattr(n.layer, "value", n.layer) in lays]
+        if not nodes:
+            return results
+        from lingshu.core import retrieval as _rt
+        bm = {}
+        fts = getattr(self, "_fts", None)
+        if fts is not None:
+            terms = [q]
+            if _rt.context_enabled():
+                terms = _rt.content_grams(terms)
+            try:
+                bm = fts.scores_within(terms, [n.id for n in nodes])
+            except sqlite3.Error:
+                bm = {}
+        ranked = []
+        for n in nodes:
+            sim = self.char_bigram_jaccard(q, n.content)
+            tag_bonus = 0.05 if any(t in q or q in t for t in n.tags) else 0.0
+            j = min(1.0, sim + tag_bonus)
+            sc = _rt.FTSIndex.blend(j, bm.get(n.id, 0.0)) if fts is not None else j
+            ranked.append((n, sc))
+        ranked.sort(key=lambda x: (-x[1], rank_of.get(x[0].id, 0), x[0].temporal_coordinate or 0.0, x[0].id))
+        out = ranked[:limit]
+        seen = {n.id for n, _ in out}
+        for n, sc in results:
+            if len(out) >= limit:
+                break
+            if n.id not in seen:
+                out.append((n, sc))
+                seen.add(n.id)
+        return out
 
     def _anchor_rerank(self, q: str, results, layers, limit: int):
         """结构锚定（LINGSHU_ANCHOR=1）：问句显式点名容器（第N章 / 第N次会话）时，带该容器
@@ -1782,6 +1859,7 @@ class LayeredStore:
                                    -x[0].confidence))
         self.last_skipped_rows = skipped
         results = self._anchor_rerank(q, [(n, s) for n, s, _ in scored[:limit]], layers, limit)
+        results = self._time_rerank(q, results, layers, limit)
         touch = self._retrieval_touches_recency()
         for node, _ in results:
             self.increment_access(node.id, touch=touch)
